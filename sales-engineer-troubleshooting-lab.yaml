@@ -1,0 +1,246 @@
+# Kubernetes Sales Engineer Troubleshooting Lab
+# Apply: kubectl apply -f sales-engineer-troubleshooting-lab.yaml
+# Namespace: sales-lab
+#
+# Scenarios:
+# 1 CrashLoopBackOff
+# 2 ImagePullBackOff
+# 3 Service with no endpoints
+# 4 Service targetPort mismatch
+# 5 ConfigMap issue
+# 6 Secret key mismatch
+# 7 PVC Pending
+# 8 Pod Pending / nodeSelector
+# 9 DNS / Service testing
+# 10 Resource requests vs actual usage
+#
+# NodeNotReady/CNI/containerd failures are NOT induced here because
+# they can affect your entire 2-node cluster. Safe node exercises
+# are documented at the bottom.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sales-lab
+---
+# 1. CrashLoopBackOff
+apiVersion: v1
+kind: Pod
+metadata:
+  name: crashloop-demo
+  namespace: sales-lab
+spec:
+  containers:
+  - name: app
+    image: busybox:1.37.0
+    command: ["/bin/sh","-c"]
+    args: ["echo 'ERROR: DATABASE_URL environment variable is not set'; exit 1"]
+---
+# 2. ImagePullBackOff
+apiVersion: v1
+kind: Pod
+metadata:
+  name: imagepull-demo
+  namespace: sales-lab
+spec:
+  containers:
+  - name: app
+    image: nginx:this-tag-does-not-exist
+---
+# 3. Service has no endpoints: selector does not match Pod
+apiVersion: v1
+kind: Pod
+metadata:
+  name: endpoint-demo
+  namespace: sales-lab
+  labels:
+    app: backend
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.27
+    ports:
+    - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: no-endpoint-svc
+  namespace: sales-lab
+spec:
+  selector:
+    app: wrong-label
+  ports:
+  - port: 80
+    targetPort: 80
+---
+# 4. Service targetPort mismatch: Pod listens on 80, Service sends to 8080
+apiVersion: v1
+kind: Service
+metadata:
+  name: targetport-demo
+  namespace: sales-lab
+spec:
+  selector:
+    app: backend
+  ports:
+  - port: 80
+    targetPort: 8080
+---
+# 5. ConfigMap issue: Pod expects APP_MODE but it is not injected
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: sales-lab
+data:
+  APP_MODE: production
+  LOG_LEVEL: info
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: configmap-demo
+  namespace: sales-lab
+spec:
+  containers:
+  - name: app
+    image: busybox:1.37.0
+    command: ["/bin/sh","-c"]
+    args:
+    - 'if [ -z "$APP_MODE" ]; then echo "ERROR: APP_MODE is not set"; exit 1; fi; echo "APP_MODE=$APP_MODE"; sleep 3600'
+---
+# 6. Secret key mismatch: Secret has username/password, Pod asks for db_user
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-secret
+  namespace: sales-lab
+type: Opaque
+stringData:
+  username: dbuser
+  password: dbpassword
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secret-demo
+  namespace: sales-lab
+spec:
+  containers:
+  - name: app
+    image: busybox:1.37.0
+    command: ["/bin/sh","-c"]
+    args: ["echo starting; sleep 3600"]
+    env:
+    - name: DB_USER
+      valueFrom:
+        secretKeyRef:
+          name: db-secret
+          key: db_user
+---
+# 7. PVC Pending: intentionally nonexistent StorageClass
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pending-pvc
+  namespace: sales-lab
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: sales-lab-nonexistent
+  resources:
+    requests:
+      storage: 5Gi
+---
+# 8. Pod Pending: requires a node label workload=special
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pending-selector-demo
+  namespace: sales-lab
+spec:
+  nodeSelector:
+    workload: special
+  containers:
+  - name: app
+    image: nginx:1.27
+---
+# 9. DNS / Service troubleshooting
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dns-demo
+  namespace: sales-lab
+  labels:
+    app: dns-demo
+spec:
+  containers:
+  - name: nginx
+    image: nginx:1.27
+    ports:
+    - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-demo
+  namespace: sales-lab
+spec:
+  selector:
+    app: dns-demo
+  ports:
+  - port: 80
+    targetPort: 80
+---
+# 10. Resource investigation: intentionally large requests
+apiVersion: v1
+kind: Pod
+metadata:
+  name: resource-demo
+  namespace: sales-lab
+spec:
+  containers:
+  - name: app
+    image: nginx:1.27
+    resources:
+      requests:
+        cpu: 1500m
+        memory: 1Gi
+      limits:
+        cpu: "2"
+        memory: 2Gi
+
+# Useful commands:
+# kubectl get pods -n sales-lab
+# kubectl get events -n sales-lab --sort-by=.lastTimestamp
+# kubectl describe pod <pod> -n sales-lab
+# kubectl logs <pod> -n sales-lab
+# kubectl logs <pod> -n sales-lab --previous
+# kubectl get svc -n sales-lab
+# kubectl get endpoints -n sales-lab
+# kubectl get nodes --show-labels
+# kubectl get pvc -n sales-lab
+# kubectl describe pvc <pvc> -n sales-lab
+# kubectl top pods -n sales-lab
+#
+# Temporary connectivity tester:
+# kubectl run testpod --image=busybox:1.37.0 -it --rm --restart=Never -- sh
+# kubectl run testpod --image=busybox:1.37.0 -it --rm --restart=Never -- nslookup dns-demo
+# kubectl run testpod --image=busybox:1.37.0 -it --rm --restart=Never -- wget -qO- http://dns-demo:80
+#
+# Safe node exercises:
+# kubectl label node <node> workload=special
+# kubectl get pod pending-selector-demo -n sales-lab -w
+# kubectl label node <node> workload-
+#
+# Taint exercise:
+# kubectl taint node <node> dedicated=lab:NoSchedule
+# kubectl describe pod <pod> -n sales-lab
+# kubectl taint node <node> dedicated=lab:NoSchedule-
+#
+# Maintenance:
+# kubectl cordon <node>
+# kubectl uncordon <node>
+#
+# Do NOT intentionally stop kubelet/containerd/CNI on a shared 2-node
+# cluster. Practice those failures on a disposable VM instead.
